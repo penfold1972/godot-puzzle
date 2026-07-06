@@ -54,6 +54,8 @@ static func solve(level: Dictionary) -> Dictionary:
 			return int(screws[a]["hole"]) < int(screws[b]["hole"]))
 		for si: int in order:
 			var screw: Dictionary = screws[si]
+			if (screw["plates"] as Array).is_empty():
+				continue  # parked screws never make progress quasi-statically
 			if not Rules.can_remove(screw, board_holes, plates):
 				continue
 			var rest: Array = screws.duplicate()

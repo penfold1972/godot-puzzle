@@ -93,15 +93,14 @@ func _test_order_forced() -> void:
 
 
 func _test_dev_levels_match_python() -> void:
-	# Expected values produced by: python3 tools/quasi_solver.py
-	var expected := {"level_001.json": 3, "level_002.json": 4}
-	var files: PackedStringArray = LevelLoaderScript.level_files()
-	for i in files.size():
-		var fname: String = files[i]
-		if not expected.has(fname):
-			continue
+	# Fixture levels kept outside index.json. Expected values produced by:
+	# python3 tools/quasi_solver.py (dev fixtures solve in 3 and 4 moves).
+	var expected := {"dev_a.json": 3, "dev_b.json": 4}
+	for fname: String in expected:
 		var level: Dictionary = LevelLoaderScript.load_level_file(
 			LevelLoaderScript.LEVELS_DIR + fname)
+		var errors: Array[String] = LevelLoaderScript.validate(level)
+		_check(errors.is_empty(), "%s passes validation (%s)" % [fname, errors])
 		var result: Dictionary = QuasiSolverScript.solve(level)
 		_check(result["solvable"] and int(result["moves"]) == int(expected[fname]),
 			"%s: solvable in %d moves matching Python (got %s)" % [

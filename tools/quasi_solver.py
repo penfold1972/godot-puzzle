@@ -58,6 +58,8 @@ def solve(level):
         best = None  # (neg_drops, hole, screw_index, dropped_ids, dest, dest_pinned)
         for si in sorted(range(len(screws)), key=lambda i: screws[i]["hole"]):
             screw = screws[si]
+            if not screw["plates"]:
+                continue  # parked screws never make progress quasi-statically
             if not rules.can_remove(screw, board_holes, plates):
                 continue
             # Simulate removal: plates losing their last pin drop instantly.

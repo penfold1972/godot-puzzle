@@ -1,666 +1,636 @@
 #!/usr/bin/env python3
-"""Offline level generator + validator for Screw Puzzle.
+"""v2 level generator: silhouette pin-board puzzles.
 
-Generates the seeded bulk levels, builds the designed showcase levels
-(tutorial, shirt, star, vault), validates everything (schema rules mirrored
-from src/core/level_loader.gd and solvability mirrored from
-src/core/solver.gd), and writes levels/*.json + levels/index.json.
+Pipeline per level (deterministic, seed = 4000 + level + attempt*100000):
+  1. Scale the level's silhouette (tools/silhouettes.py) into the board.
+  2. Ear-clip triangulate it, then grow N connected regions over the
+     triangle adjacency graph (area-balanced BFS) -- the base plates.
+     Each region boundary is extracted and shrunk ~3 px toward its centroid
+     so same-layer neighbours never touch (they share a collision layer).
+  3. Late levels add brace plates (layer 1): the two-triangle quad around a
+     seam edge, pinned through shared screws with the pieces beneath.
+  4. Punch screws (1-3 per piece by area), a top parking rail of empty
+     holes, and a few empty in-piece sockets for re-pinning.
+  5. Gate with tools/validate_v2.py rules and tools/quasi_solver.py; retry
+     with a new sub-seed until the level passes.
 
-Deterministic: level N always regenerates identically (seed = 1000 + N).
+Difficulty ramp over 50 levels: pieces 3->10, braces 0->2, parking rail
+6->2 holes, screw caps 2->3. Each of the 17 silhouettes appears ~3 times
+(I/II/III) at rising difficulty.
 
-Usage (from the screw_puzzle/ folder):
-    python3 tools/generate_levels.py             # generate + validate + write
-    python3 tools/generate_levels.py --validate  # only validate existing files
+Usage:
+  python3 tools/generate_levels.py             # write levels/*.json + index
+  python3 tools/generate_levels.py --svg DIR   # also dump per-level SVGs
 """
 
+import heapq
 import json
 import math
 import os
 import random
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rules
+import silhouettes
+import validate_v2
+import quasi_solver
+
 LEVEL_COUNT = 50
-HANDMADE = {1, 10, 30, 50}  # slots built by build_handmade(), not the RNG
-
+LEVELS_DIR = validate_v2.LEVELS_DIR
 BOUNDS = (720, 1000)
-MARGIN = 30  # keep plates this far inside the board
-MIN_PLATE_AREA = 2000.0  # mirror of LevelLoader.MIN_PLATE_AREA
-EDGE_MARGIN = 24.0       # mirror of LevelLoader.EDGE_MARGIN
-SCREW_EDGE_MARGIN = 28.0  # generator uses a stricter margin than the loader
-MIN_SCREW_SPACING = 55.0
-MAX_SCREWS = 4
-SAME_LAYER_GAP = 3.0     # required clearance between same-layer plates
-
-LAYER_COLORS = [
-    ["#8f9fae", "#98a8b8", "#a2b1bf"],   # layer 0: steel
-    ["#7f93a8", "#8a9db1", "#95a7ba"],   # layer 1: darker steel blue
-    ["#a8b6c2", "#b1bec9", "#bac6d0"],   # layer 2: light steel
-    ["#b8a37f", "#c2ad89", "#ccb793"],   # layer 3: brass
-    ["#8ba69b", "#95b0a5", "#9fbaaf"],   # layer 4: patina
-    ["#a89f8f", "#b2a999", "#bcb3a3"],   # layer 5: bronze grey
-]
-
-LEVELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "levels")
+SIL_BOX = (60, 190, 660, 940)
+RAIL_Y = 70
+MIN_PIECE_AREA = 7000.0
+SEAM_GAP = 3.0
+SCREW_MARGIN = 28.0
+HOLE_SPACING = 46.0  # a hair above the validator's 44 for float safety
+ATTEMPTS = 60
 
 
-# ---------------------------------------------------------------- geometry
+# ------------------------------------------------------------- geometry
 
-def signed_area(points):
-    total = 0.0
-    for i, a in enumerate(points):
-        b = points[(i + 1) % len(points)]
-        total += a[0] * b[1] - b[0] * a[1]
-    return total * 0.5
+def area(points):
+    return validate_v2.signed_area(points)
 
 
-def point_in_polygon(p, points):
-    """Ray-casting test (matches Godot's Geometry2D.is_point_in_polygon
-    for interior points; screws never sit on edges thanks to margins)."""
-    x, y = p
-    inside = False
+def centroid(points):
+    cx = sum(p[0] for p in points) / len(points)
+    cy = sum(p[1] for p in points) / len(points)
+    return (cx, cy)
+
+
+def tri_area(a, b, c):
+    return ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2.0
+
+
+def ear_clip(points):
+    """Triangulate a simple CCW polygon; returns list of index triples."""
     n = len(points)
-    for i in range(n):
-        ax, ay = points[i]
-        bx, by = points[(i + 1) % n]
-        if (ay > y) != (by > y):
-            t = (y - ay) / (by - ay)
-            if x < ax + t * (bx - ax):
-                inside = not inside
-    return inside
-
-
-def dist_point_segment(p, a, b):
-    px, py = p
-    ax, ay = a
-    bx, by = b
-    dx, dy = bx - ax, by - ay
-    length_sq = dx * dx + dy * dy
-    if length_sq == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
-
-
-def dist_to_edges(p, points):
-    return min(
-        dist_point_segment(p, points[i], points[(i + 1) % len(points)])
-        for i in range(len(points))
-    )
-
-
-def segments_intersect(p1, p2, p3, p4):
-    def orient(a, b, c):
-        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-        if abs(v) < 1e-9:
-            return 0
-        return 1 if v > 0 else -1
-
-    def on_seg(a, b, c):
-        return (min(a[0], b[0]) - 1e-9 <= c[0] <= max(a[0], b[0]) + 1e-9
-                and min(a[1], b[1]) - 1e-9 <= c[1] <= max(a[1], b[1]) + 1e-9)
-
-    o1, o2 = orient(p1, p2, p3), orient(p1, p2, p4)
-    o3, o4 = orient(p3, p4, p1), orient(p3, p4, p2)
-    if o1 != o2 and o3 != o4:
-        return True
-    if o1 == 0 and on_seg(p1, p2, p3):
-        return True
-    if o2 == 0 and on_seg(p1, p2, p4):
-        return True
-    if o3 == 0 and on_seg(p3, p4, p1):
-        return True
-    if o4 == 0 and on_seg(p3, p4, p2):
-        return True
-    return False
-
-
-def is_self_intersecting(points):
-    n = len(points)
-    for i in range(n):
-        a1, a2 = points[i], points[(i + 1) % n]
-        for j in range(i + 1, n):
-            if j == i or (j + 1) % n == i or (i + 1) % n == j:
-                continue  # adjacent edges share a vertex
-            b1, b2 = points[j], points[(j + 1) % n]
-            if segments_intersect(a1, a2, b1, b2):
-                return True
-    return False
-
-
-def polygons_overlap(pa, pb):
-    """True if two simple polygons overlap (edge crossing or containment)."""
-    for i in range(len(pa)):
-        for j in range(len(pb)):
-            if segments_intersect(pa[i], pa[(i + 1) % len(pa)],
-                                  pb[j], pb[(j + 1) % len(pb)]):
-                return True
-    return point_in_polygon(pa[0], pb) or point_in_polygon(pb[0], pa)
-
-
-def polygon_clearance(pa, pb):
-    """Minimum distance between two non-overlapping polygons' boundaries."""
-    best = float("inf")
-    for i in range(len(pa)):
-        for p in (pa[i],):
-            for j in range(len(pb)):
-                best = min(best, dist_point_segment(
-                    p, pb[j], pb[(j + 1) % len(pb)]))
-    for j in range(len(pb)):
-        for p in (pb[j],):
-            for i in range(len(pa)):
-                best = min(best, dist_point_segment(
-                    p, pa[i], pa[(i + 1) % len(pa)]))
-    return best
-
-
-def convex_hull(points):
-    pts = sorted(set(points))
-    if len(pts) <= 2:
-        return pts
-
-    def cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower, upper = [], []
-    for p in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    return lower[:-1] + upper[:-1]
-
-
-# ------------------------------------------------- solver mirror (solver.gd)
-
-def solve_stats(level):
-    remaining = [
-        {"id": p["id"], "layer": p["layer"], "points": p["points"],
-         "screws": list(p["screws"])}
-        for p in level["plates"]
-    ]
-    total_screws = sum(len(p["screws"]) for p in remaining)
-
-    def blocked(plates, plate_id, screw):
-        my_layer = next(p["layer"] for p in plates if p["id"] == plate_id)
-        return any(
-            p["layer"] > my_layer and point_in_polygon(screw, p["points"])
-            for p in plates if p["id"] != plate_id
-        )
-
-    passes = 0
-    while remaining:
-        passes += 1
-        removed_any = False
-        for p in remaining:
-            kept = []
-            for s in p["screws"]:
-                if blocked(remaining, p["id"], s):
-                    kept.append(s)
-                else:
-                    removed_any = True
-            p["screws"] = kept
-        still = []
-        for p in remaining:
-            if not p["screws"]:
-                removed_any = True
-            else:
-                still.append(p)
-        remaining = still
-        if not removed_any:
-            return {"solvable": False, "passes": passes,
-                    "total_screws": total_screws}
-    return {"solvable": True, "passes": passes, "total_screws": total_screws}
-
-
-# --------------------------------------------- validator mirror (level_loader)
-
-def validate_level(level):
-    errors = []
-    plates = level.get("plates", [])
-    if not plates:
-        return ["level has no plates"]
-    seen = set()
-    for plate in plates:
-        pid = plate["id"]
-        label = "plate %d" % pid
-        if pid in seen:
-            errors.append("%s: duplicate id" % label)
-        seen.add(pid)
-        pts = plate["points"]
-        if len(pts) < 3:
-            errors.append("%s: fewer than 3 points" % label)
-            continue
-        if is_self_intersecting(pts):
-            errors.append("%s: self-intersecting polygon" % label)
-            continue
-        if abs(signed_area(pts)) < MIN_PLATE_AREA:
-            errors.append("%s: area %.0f below minimum" % (label, abs(signed_area(pts))))
-        for x, y in pts:
-            if not (0 <= x <= BOUNDS[0] and 0 <= y <= BOUNDS[1]):
-                errors.append("%s: point (%s,%s) outside bounds" % (label, x, y))
-        screws = plate["screws"]
-        if not 1 <= len(screws) <= MAX_SCREWS:
-            errors.append("%s: %d screws (allowed 1..%d)" % (label, len(screws), MAX_SCREWS))
-        for s in screws:
-            if not point_in_polygon(s, pts):
-                errors.append("%s: screw %s outside plate" % (label, s))
-            elif dist_to_edges(s, pts) < EDGE_MARGIN:
-                errors.append("%s: screw %s too close to edge (%.1f < %.1f)"
-                              % (label, s, dist_to_edges(s, pts), EDGE_MARGIN))
-    for i in range(len(plates)):
-        for j in range(i + 1, len(plates)):
-            a, b = plates[i], plates[j]
-            if a["layer"] != b["layer"]:
-                continue
-            if polygons_overlap(a["points"], b["points"]):
-                errors.append("plates %d and %d overlap on layer %d"
-                              % (a["id"], b["id"], a["layer"]))
-            elif polygon_clearance(a["points"], b["points"]) < SAME_LAYER_GAP:
-                errors.append("plates %d and %d too close on layer %d"
-                              % (a["id"], b["id"], a["layer"]))
-    return errors
-
-
-# ----------------------------------------------------------------- generator
-
-def make_convex_plate(rng, center, radius):
-    """Random convex polygon around center; returns int coordinate list."""
-    if rng.random() < 0.3:
-        # Rectangle, sometimes slightly rotated.
-        w = radius * rng.uniform(0.9, 1.6)
-        h = radius * rng.uniform(0.7, 1.2)
-        angle = rng.uniform(-0.2, 0.2) if rng.random() < 0.5 else 0.0
-        pts = []
-        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
-            x = sx * w / 2, sy * h / 2
-            rx = x[0] * math.cos(angle) - x[1] * math.sin(angle)
-            ry = x[0] * math.sin(angle) + x[1] * math.cos(angle)
-            pts.append((center[0] + rx, center[1] + ry))
-        hull = pts
-    else:
-        count = rng.randint(6, 10)
-        cloud = []
-        for _ in range(count):
-            a = rng.uniform(0, 2 * math.pi)
-            r = radius * rng.uniform(0.55, 1.0)
-            cloud.append((center[0] + r * math.cos(a),
-                          center[1] + r * math.sin(a)))
-        hull = convex_hull(cloud)
-    return [(int(round(x)), int(round(y))) for x, y in hull]
-
-
-def plate_ok(points, same_layer_plates):
-    if len(points) < 3 or is_self_intersecting(points):
-        return False
-    if abs(signed_area(points)) < MIN_PLATE_AREA * 3:
-        return False
-    for x, y in points:
-        if not (MARGIN <= x <= BOUNDS[0] - MARGIN and MARGIN <= y <= BOUNDS[1] - MARGIN):
-            return False
-    for other in same_layer_plates:
-        if polygons_overlap(points, other["points"]):
-            return False
-        if polygon_clearance(points, other["points"]) < SAME_LAYER_GAP:
-            return False
-    return True
-
-
-def sample_screws(rng, points, count):
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    screws = []
-    for _ in range(600):
-        if len(screws) == count:
-            break
-        p = (rng.randint(min(xs), max(xs)), rng.randint(min(ys), max(ys)))
-        if not point_in_polygon(p, points):
-            continue
-        if dist_to_edges(p, points) < SCREW_EDGE_MARGIN:
-            continue
-        if any(math.hypot(p[0] - s[0], p[1] - s[1]) < MIN_SCREW_SPACING for s in screws):
-            continue
-        screws.append(p)
-    return screws
-
-
-def difficulty(n):
-    """Level parameters for generated level n (1-based)."""
-    return {
-        "plates": min(3 + n // 6, 10),
-        "layers": min(2 + n // 10, 6),
-        "max_screws": 2 if n < 12 else (3 if n < 30 else 4),
-        "min_passes": 1 if n < 8 else (2 if n < 15 else (3 if n < 35 else 4)),
-    }
-
-
-def generate_level(n):
-    params = difficulty(n)
-    for attempt in range(80):
-        rng = random.Random(1000 + n + attempt * 100_000)
-        level = try_generate(rng, n, params)
-        if level is None:
-            continue
-        if validate_level(level):
-            continue
-        stats = solve_stats(level)
-        if not stats["solvable"]:
-            continue
-        if stats["passes"] < params["min_passes"] and attempt < 60:
-            continue  # not interlocked enough for this depth yet; retry
-        return level
-    raise RuntimeError("could not generate level %d" % n)
-
-
-def try_generate(rng, n, params):
-    total_plates = params["plates"]
-    layer_count = params["layers"]
-
-    # Distribute plates over layers: every layer gets one, remainder biased low.
-    per_layer = [1] * layer_count
-    for _ in range(total_plates - layer_count):
-        weights = [layer_count - i for i in range(layer_count)]
-        per_layer[rng.choices(range(layer_count), weights=weights)[0]] += 1
-
-    plates = []
-    pid = 0
-    for layer in range(layer_count):
-        same_layer = [p for p in plates if p["layer"] == layer]
-        for _ in range(per_layer[layer]):
-            placed = False
-            for _ in range(120):
-                radius = rng.uniform(85, 170) * (1.0 - 0.05 * layer)
-                if layer == 0:
-                    center = (rng.uniform(MARGIN + radius, BOUNDS[0] - MARGIN - radius),
-                              rng.uniform(MARGIN + radius + 60, BOUNDS[1] - MARGIN - radius))
-                else:
-                    # Aim at a screw on a lower layer to create interlock.
-                    lower = [p for p in plates if p["layer"] < layer and p["screws"]]
-                    if not lower:
-                        return None
-                    prefer = [p for p in lower if p["layer"] == layer - 1]
-                    source = rng.choice(prefer if prefer and rng.random() < 0.7 else lower)
-                    target = rng.choice(source["screws"])
-                    center = (target[0] + rng.uniform(-40, 40),
-                              target[1] + rng.uniform(-40, 40))
-                points = make_convex_plate(rng, center, radius)
-                if not plate_ok(points, same_layer):
+    idx = list(range(n))
+    tris = []
+    guard = 0
+    while len(idx) > 3 and guard < 10000:
+        guard += 1
+        ear_found = False
+        for k in range(len(idx)):
+            i0, i1, i2 = (idx[(k - 1) % len(idx)], idx[k], idx[(k + 1) % len(idx)])
+            a, b, c = points[i0], points[i1], points[i2]
+            if tri_area(a, b, c) <= 1e-9:
+                continue  # reflex or degenerate corner
+            ok = True
+            for j in idx:
+                if j in (i0, i1, i2):
                     continue
-                if layer > 0:
-                    # The plate must actually cover the target screw, and
-                    # cover it comfortably (no boundary ambiguity).
-                    if not point_in_polygon(target, points):
-                        continue
-                    if dist_to_edges(target, points) < 8.0:
-                        continue
-                screw_count = rng.randint(1, params["max_screws"])
-                screws = sample_screws(rng, points, screw_count)
-                if not screws:
-                    continue
-                plate = {"id": pid, "layer": layer, "points": points,
-                         "screws": screws,
-                         "color": rng.choice(LAYER_COLORS[layer % len(LAYER_COLORS)])}
-                plates.append(plate)
-                same_layer.append(plate)
-                pid += 1
-                placed = True
+                p = points[j]
+                if (tri_area(a, b, p) >= -1e-9 and tri_area(b, c, p) >= -1e-9
+                        and tri_area(c, a, p) >= -1e-9):
+                    ok = False
+                    break
+            if ok:
+                tris.append((i0, i1, i2))
+                idx.pop(k)
+                ear_found = True
                 break
-            if not placed:
+        if not ear_found:
+            return None  # numeric trouble; caller retries
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+def grow_regions(points, tris, n_regions, rng):
+    """Partition triangles into n connected, area-balanced regions."""
+    n_regions = min(n_regions, len(tris))
+    tri_areas = [abs(tri_area(points[a], points[b], points[c])) for a, b, c in tris]
+    tri_centers = [centroid([points[a], points[b], points[c]]) for a, b, c in tris]
+
+    # Adjacency via shared edges.
+    edge_owner = {}
+    adj = [[] for _ in tris]
+    for ti, (a, b, c) in enumerate(tris):
+        for e in ((a, b), (b, c), (c, a)):
+            key = (min(e), max(e))
+            if key in edge_owner:
+                other = edge_owner[key]
+                adj[ti].append(other)
+                adj[other].append(ti)
+            else:
+                edge_owner[key] = ti
+
+    # Farthest-point seeding.
+    seeds = [rng.randrange(len(tris))]
+    while len(seeds) < n_regions:
+        best, best_d = None, -1.0
+        for ti in range(len(tris)):
+            if ti in seeds:
+                continue
+            d = min(math.dist(tri_centers[ti], tri_centers[s]) for s in seeds)
+            if d > best_d:
+                best, best_d = ti, d
+        seeds.append(best)
+
+    assign = [-1] * len(tris)
+    heap = []
+    for ri, s in enumerate(seeds):
+        assign[s] = ri
+        heapq.heappush(heap, (tri_areas[s], rng.random(), ri))
+    region_area = [tri_areas[s] for s in seeds]
+    frontier = [set(adj[s]) for s in seeds]
+
+    remaining = len(tris) - len(seeds)
+    guard = 0
+    while remaining > 0 and guard < 20000:
+        guard += 1
+        if not heap:
+            break
+        _, _, ri = heapq.heappop(heap)
+        pick = None
+        for cand in sorted(frontier[ri]):
+            if assign[cand] == -1:
+                pick = cand
+                break
+        frontier[ri] = {t for t in frontier[ri] if assign[t] == -1}
+        if pick is None:
+            continue  # region closed off; do not requeue
+        assign[pick] = ri
+        region_area[ri] += tri_areas[pick]
+        frontier[ri].update(t for t in adj[pick] if assign[t] == -1)
+        remaining -= 1
+        heapq.heappush(heap, (region_area[ri], rng.random(), ri))
+
+    if remaining > 0:
+        # Orphans (unreachable from any open region): give them to any
+        # assigned neighbour to keep every region connected.
+        for _ in range(len(tris)):
+            progressed = False
+            for ti in range(len(tris)):
+                if assign[ti] != -1:
+                    continue
+                for nb in adj[ti]:
+                    if assign[nb] != -1:
+                        assign[ti] = assign[nb]
+                        progressed = True
+                        break
+            if all(a != -1 for a in assign):
+                break
+            if not progressed:
                 return None
+    return assign
 
+
+def region_boundary(points, tris, assign, region_id):
+    """Boundary polygon of one region; None if it isn't a single loop."""
+    edges = set()
+    for ti, (a, b, c) in enumerate(tris):
+        if assign[ti] != region_id:
+            continue
+        for e in ((a, b), (b, c), (c, a)):
+            if (e[1], e[0]) in edges:
+                edges.discard((e[1], e[0]))
+            else:
+                edges.add(e)
+    if not edges:
+        return None
+    nxt = {}
+    for a, b in edges:
+        if a in nxt:
+            return None  # non-manifold vertex; retry
+        nxt[a] = b
+    start = next(iter(nxt))
+    loop = [start]
+    cur = nxt[start]
+    guard = 0
+    while cur != start and guard < len(nxt) + 2:
+        guard += 1
+        loop.append(cur)
+        if cur not in nxt:
+            return None
+        cur = nxt[cur]
+    if len(loop) != len(nxt):
+        return None  # multiple loops (region with hole)
+    out = [points[i] for i in loop]
+    # Drop collinear runs to keep vertex counts sane.
+    cleaned = []
+    m = len(out)
+    for i in range(m):
+        a, b, c = out[(i - 1) % m], out[i], out[(i + 1) % m]
+        if abs(tri_area(a, b, c)) > 1e-6:
+            cleaned.append(b)
+    return cleaned if len(cleaned) >= 3 else None
+
+
+def shrink(points, gap=SEAM_GAP):
+    """Pull every vertex `gap` px toward the centroid (seam separation)."""
+    c = centroid(points)
+    out = []
+    for p in points:
+        d = math.dist(p, c)
+        if d < gap * 4:
+            out.append(p)
+        else:
+            f = (d - gap) / d
+            out.append((c[0] + (p[0] - c[0]) * f, c[1] + (p[1] - c[1]) * f))
+    return out
+
+
+def rnd(points):
+    return [(round(x, 1), round(y, 1)) for x, y in points]
+
+
+# ------------------------------------------------------------ difficulty
+
+DISPLAY = {
+    "tshirt": "T-Shirt", "collared_shirt": "Dress Shirt", "pants": "Pants",
+    "mens_shoe": "Loafer", "womens_heel": "Stiletto", "car": "Car",
+    "truck": "Pickup", "motorcycle": "Motorcycle", "cup": "Mug",
+    "flamingo": "Flamingo", "dog": "Dog", "cat": "Cat", "robot": "Robot",
+    "flying_saucer": "UFO", "house": "House", "sofa": "Sofa",
+    "skyscraper": "Skyscraper",
+}
+ROMAN = ["I", "II", "III"]
+
+
+def schedule():
+    order = list(silhouettes.NAMES)
+    random.Random(7).shuffle(order)
+    plan = []
+    for n in range(1, LEVEL_COUNT + 1):
+        name = order[(n - 1) % len(order)]
+        use = (n - 1) // len(order)
+        plan.append((name, use))
+    return plan
+
+
+def params(n):
     return {
+        "pieces": min(3 + n // 7, 10),
+        "braces": 0 if n < 16 else (1 if n < 32 else 2),
+        "rail": max(2, 6 - n // 12),
+        "sockets": 2 if n < 20 else 1,
+        "max_screws": 2 if n < 18 else 3,
+    }
+
+
+# ------------------------------------------------------------- assembly
+
+def _tri_adjacency(tris):
+    edge_owner = {}
+    adj = [[] for _ in tris]
+    for ti, (a, b, c) in enumerate(tris):
+        for e in ((a, b), (b, c), (c, a)):
+            key = (min(e), max(e))
+            if key in edge_owner:
+                other = edge_owner[key]
+                adj[ti].append(other)
+                adj[other].append(ti)
+            else:
+                edge_owner[key] = ti
+    return adj
+
+
+def _build_pieces(outline, tris, assign):
+    """region id -> shrunk piece polygon, or None if any region is broken."""
+    out = {}
+    for rid in sorted(set(assign)):
+        boundary = region_boundary(outline, tris, assign, rid)
+        if boundary is None:
+            return None
+        if area(boundary) < 0:
+            boundary.reverse()
+        piece = rnd(shrink(boundary))
+        if validate_v2.is_self_intersecting(piece):
+            return None
+        out[rid] = piece
+    return out
+
+
+def sample_point_inside(rng, poly, margin, taken, clear_polys=(), tries=400):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    for _ in range(tries):
+        p = (rng.uniform(min(xs), max(xs)), rng.uniform(min(ys), max(ys)))
+        if not rules.point_in_polygon(p, poly):
+            continue
+        if validate_v2.dist_to_edges(p, poly) < margin:
+            continue
+        if any(math.dist(p, t) < HOLE_SPACING for t in taken):
+            continue
+        bad = False
+        for cp in clear_polys:
+            if rules.point_in_polygon(p, cp) or validate_v2.dist_to_edges(p, cp) < 8:
+                bad = True
+                break
+        if bad:
+            continue
+        return (round(p[0], 1), round(p[1], 1))
+    return None
+
+
+def try_generate(n, name, use, rng):
+    prm = params(n)
+    outline, palette = silhouettes.get(name, SIL_BOX)
+    tris = ear_clip(outline)
+    if tris is None:
+        return None
+    assign = grow_regions(outline, tris, prm["pieces"], rng)
+    if assign is None:
+        return None
+
+    # Build pieces; regions too thin or small to hold a screw (a flamingo
+    # leg, a spire tip) get merged into an adjacent region and we rebuild.
+    adj = _tri_adjacency(tris)
+    pieces = None
+    for _ in range(6):
+        built = _build_pieces(outline, tris, assign)
+        if built is None:
+            return None
+        bad = None
+        for rid in sorted(built):
+            piece = built[rid]
+            if (abs(area(piece)) < MIN_PIECE_AREA
+                    or sample_point_inside(rng, piece, SCREW_MARGIN, [],
+                                           tries=250) is None):
+                bad = rid
+                break
+        if bad is None:
+            pieces = built
+            break
+        merged = False
+        for ti in range(len(tris)):
+            if assign[ti] != bad:
+                continue
+            for nb in adj[ti]:
+                if assign[nb] != bad:
+                    target = assign[nb]
+                    assign = [target if a == bad else a for a in assign]
+                    merged = True
+                    break
+            if merged:
+                break
+        if not merged:
+            return None
+    if pieces is None or len(pieces) < 2:
+        return None
+    # Renumber region ids compactly, keeping deterministic order.
+    rid_order = sorted(pieces)
+    rid_map = {rid: i for i, rid in enumerate(rid_order)}
+    assign = [rid_map[a] for a in assign]
+    pieces = [pieces[rid] for rid in rid_order]
+    n_regions = len(pieces)
+
+    # --- Braces: two-triangle quads over seams between different regions.
+    braces = []
+    if prm["braces"] > 0:
+        edge_tris = {}
+        for ti, (a, b, c) in enumerate(tris):
+            for e in ((a, b), (b, c), (c, a)):
+                key = (min(e), max(e))
+                edge_tris.setdefault(key, []).append(ti)
+        seams = []
+        for (a, b), owners in edge_tris.items():
+            if len(owners) == 2 and assign[owners[0]] != assign[owners[1]]:
+                length = math.dist(outline[a], outline[b])
+                seams.append((length, a, b, owners[0], owners[1]))
+        seams.sort(reverse=True)
+        for length, a, b, t1, t2 in seams:
+            if len(braces) >= prm["braces"]:
+                break
+            if length < 100:
+                continue
+            # A rectangular strap laid along the seam, wide enough on both
+            # sides to take a screw with full edge margins.
+            pa, pb = outline[a], outline[b]
+            mid = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
+            dx, dy = (pb[0] - pa[0]) / length, (pb[1] - pa[1]) / length
+            half_l = min(length * 0.35, 115.0)
+            half_w = 65.0
+            rect = [
+                (mid[0] + dx * half_l + dy * half_w, mid[1] + dy * half_l - dx * half_w),
+                (mid[0] + dx * half_l - dy * half_w, mid[1] + dy * half_l + dx * half_w),
+                (mid[0] - dx * half_l - dy * half_w, mid[1] - dy * half_l + dx * half_w),
+                (mid[0] - dx * half_l + dy * half_w, mid[1] - dy * half_l - dx * half_w),
+            ]
+            if any(not (30 <= x <= BOUNDS[0] - 30 and 160 <= y <= BOUNDS[1] - 30)
+                   for x, y in rect):
+                continue
+            if area(rect) < 0:
+                rect.reverse()
+            rect = rnd(rect)
+            if any(validate_v2.polygons_overlap(rect, br["points"]) for br in braces):
+                continue
+            braces.append({
+                "points": rect,
+                "covers": (assign[t1], assign[t2]),
+            })
+
+    # --- Screws, holes, pins.
+    board_holes = []
+    plate_holes = {i: [] for i in range(n_regions)}
+    brace_holes = {i: [] for i in range(len(braces))}
+    screws = []  # (hole_index, [plate ids])
+
+    def add_hole(p):
+        board_holes.append(p)
+        return len(board_holes) - 1
+
+    # Braced pieces first: each needs one screw under the brace (multi-pin).
+    piece_screw_counts = {}
+    for bi, brace in enumerate(braces):
+        for ri in brace["covers"]:
+            spot = None
+            for _ in range(200):
+                p = sample_point_inside(rng, pieces[ri], SCREW_MARGIN, board_holes)
+                if p is None:
+                    break
+                if (rules.point_in_polygon(p, brace["points"])
+                        and validate_v2.dist_to_edges(p, brace["points"]) >= SCREW_MARGIN
+                        and all(math.dist(p, h) >= HOLE_SPACING for h in brace_holes[bi])):
+                    other = [ob["points"] for oi, ob in enumerate(braces) if oi != bi]
+                    if any(rules.point_in_polygon(p, op) for op in other):
+                        continue
+                    spot = p
+                    break
+            if spot is None:
+                return None
+            hi = add_hole(spot)
+            plate_holes[ri].append(spot)
+            brace_holes[bi].append(spot)
+            screws.append((hi, [ri, n_regions + bi]))
+            piece_screw_counts[ri] = piece_screw_counts.get(ri, 0) + 1
+
+    # Regular screws for every piece (outside all braces).
+    brace_polys = [b["points"] for b in braces]
+    for ri, piece in enumerate(pieces):
+        piece_area = abs(area(piece))
+        want = 1 + (1 if piece_area > 30000 else 0) + (1 if piece_area > 90000 else 0)
+        want = min(want, prm["max_screws"])
+        have = piece_screw_counts.get(ri, 0)
+        while have < max(want, 1):
+            p = sample_point_inside(rng, piece, SCREW_MARGIN, board_holes,
+                                    clear_polys=brace_polys)
+            if p is None:
+                break
+            hi = add_hole(p)
+            plate_holes[ri].append(p)
+            screws.append((hi, [ri]))
+            have += 1
+        if have == 0:
+            return None
+
+    # Parking rail across the top (uncoverable: everything falls down).
+    rail_n = prm["rail"]
+    for k in range(rail_n):
+        x = 120 + (480 * k / max(1, rail_n - 1)) if rail_n > 1 else 360.0
+        board_holes.append((round(x, 1), float(RAIL_Y)))
+
+    # Empty in-piece sockets (single-cover spots only).
+    for _ in range(prm["sockets"]):
+        ri = rng.randrange(n_regions)
+        p = sample_point_inside(rng, pieces[ri], SCREW_MARGIN, board_holes,
+                                clear_polys=brace_polys)
+        if p is not None:
+            board_holes.append(p)
+            plate_holes[ri].append(p)
+
+    # --- Assemble level dict (raw JSON-ready format).
+    plates = []
+    for ri, piece in enumerate(pieces):
+        plates.append({
+            "id": ri, "layer": 0,
+            "color": palette[ri % len(palette)],
+            "points": piece,
+            "holes": plate_holes[ri],
+        })
+    for bi, brace in enumerate(braces):
+        plates.append({
+            "id": n_regions + bi, "layer": 1,
+            "color": palette[3 % len(palette)],
+            "points": brace["points"],
+            "holes": brace_holes[bi],
+        })
+    return {
+        "version": 2,
         "id": n,
-        "name": "generated",
+        "name": "%s %s" % (DISPLAY[name], ROMAN[min(use, 2)]),
+        "silhouette": name,
         "bounds": list(BOUNDS),
+        "board_holes": board_holes,
         "plates": plates,
+        "screws": [{"hole": hi, "plates": pids} for hi, pids in screws],
     }
 
 
-# ------------------------------------------------------------ showcase levels
-
-def rect(x0, y0, x1, y1):
-    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-
-
-def build_tutorial():
-    """Level 1: two plates, three screws, teaches the blocking rule."""
+def quasi_level(raw):
     return {
-        "id": 1, "name": "tutorial", "bounds": list(BOUNDS),
+        "board_holes": [tuple(h) for h in raw["board_holes"]],
         "plates": [
-            {"id": 0, "layer": 0, "color": "#98a8b8",
-             "points": rect(160, 340, 560, 660),
-             "screws": [(240, 500), (480, 500)]},
-            {"id": 1, "layer": 1, "color": "#b8a37f",
-             "points": rect(380, 400, 620, 600),
-             "screws": [(560, 540)]},
-        ],
-    }
-
-
-def build_shirt():
-    """Level 10: the shirt from the reference ad screenshot."""
-    return {
-        "id": 10, "name": "shirt", "bounds": list(BOUNDS),
-        "plates": [
-            # Torso (bottom layer)
-            {"id": 0, "layer": 0, "color": "#98a8b8",
-             "points": rect(230, 290, 490, 780),
-             "screws": [(270, 500), (450, 500), (270, 640), (450, 640)]},
-            # Sleeves (2px gap from the torso so same-layer plates never touch)
-            {"id": 1, "layer": 0, "color": "#a2b1bf",
-             "points": [(110, 300), (226, 282), (226, 420), (130, 450)],
-             "screws": [(178, 360)]},
-            {"id": 2, "layer": 0, "color": "#a2b1bf",
-             "points": [(494, 282), (610, 300), (590, 450), (494, 420)],
-             "screws": [(542, 360)]},
-            # Chest plate covers the torso's upper screws
-            {"id": 3, "layer": 1, "color": "#8f9fae",
-             "points": rect(240, 300, 480, 540),
-             "screws": [(285, 345), (435, 345)]},
-            # Hem/belt covers the torso's lower screws
-            {"id": 4, "layer": 1, "color": "#b8a37f",
-             "points": rect(240, 600, 480, 800),
-             "screws": [(310, 755), (410, 755)]},
-            # Collar sits on top of the chest plate
-            {"id": 5, "layer": 2, "color": "#c2ad89",
-             "points": [(295, 260), (425, 260), (360, 400)],
-             "screws": [(360, 305)]},
-        ],
-    }
-
-
-def build_star():
-    """Level 30: five-pointed star with a pentagon hub and a cap."""
-    cx, cy = 360.0, 520.0
-    outer_r, inner_r, pent_r = 215.0, 95.0, 118.0
-    plates = []
-
-    def polar(radius, deg):
-        rad = math.radians(deg)
-        return (cx + radius * math.cos(rad), cy + radius * math.sin(rad))
-
-    # Five point triangles on layer 0, shrunk toward their own tip so
-    # neighbours never touch.
-    for k in range(5):
-        tip_angle = -90 + 72 * k
-        tip = polar(outer_r, tip_angle)
-        left = polar(inner_r, tip_angle - 36)
-        right = polar(inner_r, tip_angle + 36)
-
-        def toward_tip(p, f=0.06):
-            return (p[0] + (tip[0] - p[0]) * f, p[1] + (tip[1] - p[1]) * f)
-
-        pts = [tip, toward_tip(left), toward_tip(right)]
-        pts = [(int(round(x)), int(round(y))) for x, y in pts]
-        centroid = (sum(p[0] for p in pts) // 3, sum(p[1] for p in pts) // 3)
-        # Nudge the screw toward the tip until it clears the edge margin.
-        screw = centroid
-        f = 0.0
-        while dist_to_edges(screw, pts) < SCREW_EDGE_MARGIN and f < 0.8:
-            f += 0.05
-            screw = (int(round(centroid[0] + (tip[0] - centroid[0]) * f)),
-                     int(round(centroid[1] + (tip[1] - centroid[1]) * f)))
-        plates.append({"id": k, "layer": 0, "color": "#b8a37f",
-                       "points": pts, "screws": [screw]})
-
-    # Pentagon hub on layer 1 covering the triangles' inner edges.
-    pent = [polar(pent_r, -90 + 72 * k) for k in range(5)]
-    pent = [(int(round(x)), int(round(y))) for x, y in pent]
-    pent_screws = [(int(round(x)), int(round(y)))
-                   for x, y in (polar(50, 90), polar(50, 210), polar(50, 330))]
-    plates.append({"id": 5, "layer": 1, "color": "#98a8b8",
-                   "points": pent, "screws": pent_screws})
-
-    # Diamond cap on layer 2 covering the pentagon's screws.
-    cap = [(int(cx), int(cy - 85)), (int(cx + 85), int(cy)),
-           (int(cx), int(cy + 85)), (int(cx - 85), int(cy))]
-    plates.append({"id": 6, "layer": 2, "color": "#c2ad89",
-                   "points": cap, "screws": [(int(cx), int(cy))]})
-
-    return {"id": 30, "name": "star", "bounds": list(BOUNDS), "plates": plates}
-
-
-def build_vault():
-    """Level 50: vault door -- quadrants, corner caps, core, top cap."""
-    cx, cy = 360, 520
-    plates = []
-    # Four quadrant squares (layer 0), 3px gap at the axes.
-    offsets = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-    for i, (sx, sy) in enumerate(offsets):
-        x0, y0 = cx + 3 * sx, cy + 3 * sy
-        x1, y1 = cx + 250 * sx, cy + 250 * sy
-        pts = rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-        outer = (cx + 165 * sx, cy + 165 * sy)   # covered by corner cap
-        inner = (cx + 60 * sx, cy + 60 * sy)     # covered by the core
-        plates.append({"id": i, "layer": 0, "color": "#8f9fae",
-                       "points": pts, "screws": [outer, inner]})
-    # Corner caps (layer 1) over the quadrants' outer screws.
-    for i, (sx, sy) in enumerate(offsets):
-        ccx, ccy = cx + 165 * sx, cy + 165 * sy
-        plates.append({"id": 4 + i, "layer": 1, "color": "#b8a37f",
-                       "points": rect(ccx - 70, ccy - 70, ccx + 70, ccy + 70),
-                       "screws": [(ccx, ccy)]})
-    # Core octagon (layer 2) over the quadrants' inner screws.
-    core = []
-    for k in range(8):
-        a = math.radians(22.5 + 45 * k)
-        core.append((int(round(cx + 150 * math.cos(a))),
-                     int(round(cy + 150 * math.sin(a)))))
-    plates.append({"id": 8, "layer": 2, "color": "#98a8b8",
-                   "points": core, "screws": [(cx - 60, cy), (cx + 60, cy)]})
-    # Top diamond (layer 3) over the core's screws.
-    cap = [(cx, cy - 92), (cx + 92, cy), (cx, cy + 92), (cx - 92, cy)]
-    plates.append({"id": 9, "layer": 3, "color": "#c2ad89",
-                   "points": cap, "screws": [(cx, cy)]})
-    return {"id": 50, "name": "vault", "bounds": list(BOUNDS), "plates": plates}
-
-
-def build_handmade():
-    return {1: build_tutorial(), 10: build_shirt(), 30: build_star(), 50: build_vault()}
-
-
-# ------------------------------------------------------------------ file I/O
-
-def level_to_json(level):
-    return {
-        "id": level["id"],
-        "name": level["name"],
-        "bounds": [int(b) for b in level["bounds"]],
-        "plates": [
-            {
-                "id": p["id"],
-                "layer": p["layer"],
-                "color": p["color"],
-                "points": [[int(x), int(y)] for x, y in p["points"]],
-                "screws": [[int(x), int(y)] for x, y in p["screws"]],
-            }
-            for p in level["plates"]
-        ],
-    }
-
-
-def level_from_json(raw):
-    return {
-        "id": raw["id"],
-        "name": raw.get("name", ""),
-        "bounds": raw.get("bounds", list(BOUNDS)),
-        "plates": [
-            {
-                "id": p["id"],
-                "layer": p["layer"],
-                "color": p.get("color", "#8fa3b8"),
-                "points": [tuple(pt) for pt in p["points"]],
-                "screws": [tuple(s) for s in p["screws"]],
-            }
+            {"id": p["id"], "layer": p["layer"],
+             "points": [tuple(pt) for pt in p["points"]],
+             "holes": [tuple(h) for h in p["holes"]],
+             "xform": rules.IDENTITY}
             for p in raw["plates"]
         ],
+        "screws": [{"hole": s["hole"], "plates": list(s["plates"])}
+                   for s in raw["screws"]],
     }
 
 
-def filename(n):
-    return "level_%03d.json" % n
+def generate_level(n, name, use):
+    for attempt in range(ATTEMPTS):
+        rng = random.Random(4000 + n + attempt * 100_000)
+        raw = try_generate(n, name, use, rng)
+        if raw is None:
+            continue
+        if validate_v2.validate(validate_v2.parse_level(raw)):
+            continue
+        result = quasi_solver.solve(quasi_level(raw))
+        if not result["solvable"]:
+            continue
+        raw["_moves"] = result["moves"]
+        return raw
+    raise RuntimeError("could not generate level %d (%s)" % (n, name))
 
 
-def write_levels():
+# ---------------------------------------------------------------- output
+
+def level_to_json(raw):
+    return {
+        "version": 2,
+        "id": raw["id"],
+        "name": raw["name"],
+        "silhouette": raw["silhouette"],
+        "bounds": raw["bounds"],
+        "board_holes": [[h[0], h[1]] for h in raw["board_holes"]],
+        "plates": [
+            {"id": p["id"], "layer": p["layer"], "color": p["color"],
+             "points": [[pt[0], pt[1]] for pt in p["points"]],
+             "holes": [[h[0], h[1]] for h in p["holes"]]}
+            for p in raw["plates"]
+        ],
+        "screws": raw["screws"],
+    }
+
+
+def dump_level_svg(raw, directory):
+    os.makedirs(directory, exist_ok=True)
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="360" height="500" '
+             'viewBox="0 0 720 1000">'
+             '<rect width="720" height="1000" fill="#2b415a"/>']
+    for h in raw["board_holes"]:
+        parts.append('<circle cx="%s" cy="%s" r="14" fill="#141f2a"/>' % tuple(h))
+    for p in sorted(raw["plates"], key=lambda q: q["layer"]):
+        path = " ".join("%s%s,%s" % ("M" if i == 0 else "L", pt[0], pt[1])
+                        for i, pt in enumerate(p["points"])) + " Z"
+        parts.append('<path d="%s" fill="%s" stroke="#1e2c3a" stroke-width="3" '
+                     'fill-opacity="0.92"/>' % (path, p["color"]))
+        for h in p["holes"]:
+            parts.append('<circle cx="%s" cy="%s" r="11" fill="#1e2c3a" '
+                         'fill-opacity="0.6"/>' % tuple(h))
+    for s in raw["screws"]:
+        h = raw["board_holes"][s["hole"]]
+        parts.append('<g transform="translate(%s,%s)">'
+                     '<circle r="20" fill="#ccd5dd" stroke="#6b7885" stroke-width="3"/>'
+                     '<path d="M-12,0 H12 M0,-12 V12" stroke="#4a545e" '
+                     'stroke-width="5"/></g>' % tuple(h))
+    parts.append('</svg>')
+    with open(os.path.join(directory, "level_%03d.svg" % raw["id"]), "w") as f:
+        f.write("".join(parts))
+
+
+def main():
+    svg_dir = None
+    if "--svg" in sys.argv:
+        svg_dir = sys.argv[sys.argv.index("--svg") + 1]
+    problems = silhouettes.self_check()
+    if problems:
+        for p in problems:
+            print("SILHOUETTE PROBLEM:", p)
+        return 1
+
+    plan = schedule()
     os.makedirs(LEVELS_DIR, exist_ok=True)
-    handmade = build_handmade()
-    report = []
+    print("  lvl  name             plates screws holes  moves")
+    files = []
     for n in range(1, LEVEL_COUNT + 1):
-        level = handmade[n] if n in HANDMADE else generate_level(n)
-        errors = validate_level(level)
-        stats = solve_stats(level)
-        if errors or not stats["solvable"]:
-            print("INTERNAL ERROR in level %d:" % n)
-            for e in errors:
-                print("  -", e)
-            if not stats["solvable"]:
-                print("  - not solvable")
-            return 1
-        path = os.path.join(LEVELS_DIR, filename(n))
-        with open(path, "w") as f:
-            json.dump(level_to_json(level), f, indent=1)
+        name, use = plan[n - 1]
+        raw = generate_level(n, name, use)
+        fname = "level_%03d.json" % n
+        with open(os.path.join(LEVELS_DIR, fname), "w") as f:
+            json.dump(level_to_json(raw), f, indent=1)
             f.write("\n")
-        report.append((n, level["name"], len(level["plates"]),
-                       stats["total_screws"], stats["passes"]))
+        files.append(fname)
+        if svg_dir:
+            dump_level_svg(raw, svg_dir)
+        print("  %3d  %-16s %6d %6d %5d %6d" % (
+            n, raw["name"], len(raw["plates"]), len(raw["screws"]),
+            len(raw["board_holes"]), raw["_moves"]))
     with open(os.path.join(LEVELS_DIR, "index.json"), "w") as f:
-        json.dump({"levels": [filename(n) for n in range(1, LEVEL_COUNT + 1)]},
-                  f, indent=1)
+        json.dump({"levels": files}, f, indent=1)
         f.write("\n")
-
-    print("  lvl  name        plates  screws  passes")
-    for n, name, plates, screws, passes in report:
-        print("  %3d  %-10s  %6d  %6d  %6d" % (n, name, plates, screws, passes))
     print("Wrote %d levels to %s" % (LEVEL_COUNT, os.path.normpath(LEVELS_DIR)))
     return 0
 
 
-def validate_existing():
-    index_path = os.path.join(LEVELS_DIR, "index.json")
-    with open(index_path) as f:
-        files = json.load(f)["levels"]
-    failures = 0
-    for i, fname in enumerate(files):
-        with open(os.path.join(LEVELS_DIR, fname)) as f:
-            level = level_from_json(json.load(f))
-        errors = validate_level(level)
-        stats = solve_stats(level)
-        if errors or not stats["solvable"]:
-            failures += 1
-            print("FAIL %s:" % fname)
-            for e in errors:
-                print("  -", e)
-            if not stats["solvable"]:
-                print("  - not solvable")
-    if len(files) < 48:
-        failures += 1
-        print("FAIL: only %d levels, need >= 48" % len(files))
-    print("%d levels checked, %d failures" % (len(files), failures))
-    return 1 if failures else 0
-
-
 if __name__ == "__main__":
-    if "--validate" in sys.argv:
-        sys.exit(validate_existing())
-    sys.exit(write_levels())
+    sys.exit(main())

@@ -6,9 +6,7 @@ extends SceneTree
 
 const LevelLoaderScript := preload("res://src/core/level_loader.gd")
 
-## Raised back to 48 when the v2 generator regenerates the full catalog;
-## during the v2 rebuild only the dev levels exist.
-const REQUIRED_LEVEL_COUNT := 2
+const REQUIRED_LEVEL_COUNT := 48
 
 
 func _initialize() -> void:
