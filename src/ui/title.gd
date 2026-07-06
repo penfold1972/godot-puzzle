@@ -8,6 +8,7 @@ func _ready() -> void:
 	var bg := ColorRect.new()
 	bg.color = Color("#35506b")
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(bg)
 
 	var center := CenterContainer.new()

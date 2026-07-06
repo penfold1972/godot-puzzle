@@ -53,6 +53,11 @@ func _build_background() -> void:
 	var bg := ColorRect.new()
 	bg.color = Color("#35506b")
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	# CRITICAL: a Control's default mouse_filter is STOP, which marks every
+	# click/touch as handled during GUI processing -- and only UNhandled
+	# input reaches the 2D physics picking that delivers taps to the
+	# Area2D screws. The background must never intercept input.
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bg_layer.add_child(bg)
 	add_child(bg_layer)
 

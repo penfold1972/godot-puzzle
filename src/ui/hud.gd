@@ -18,15 +18,21 @@ func setup(level_number: int, screws: int) -> void:
 func _ready() -> void:
 	set_anchors_preset(Control.PRESET_TOP_WIDE)
 	custom_minimum_size = Vector2(0, 130)
+	offset_bottom = 130
+	# Let taps pass through everywhere except the actual buttons, so the
+	# HUD strip never swallows input meant for screws near the top edge.
+	mouse_filter = Control.MOUSE_FILTER_PASS
 
 	var bar := HBoxContainer.new()
 	bar.set_anchors_preset(Control.PRESET_TOP_WIDE)
 	bar.custom_minimum_size = Vector2(0, 130)
 	bar.add_theme_constant_override("separation", 14)
+	bar.mouse_filter = Control.MOUSE_FILTER_PASS
 	add_child(bar)
 
 	var pad_left := Control.new()
 	pad_left.custom_minimum_size = Vector2(10, 0)
+	pad_left.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bar.add_child(pad_left)
 
 	var level_label := UiKit.make_label("Level %d" % _level_number, 40)
@@ -51,6 +57,7 @@ func _ready() -> void:
 
 	var pad_right := Control.new()
 	pad_right.custom_minimum_size = Vector2(10, 0)
+	pad_right.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bar.add_child(pad_right)
 
 
