@@ -13,6 +13,8 @@ extends RefCounted
 ##     Origin hole allowed only if the removal dropped a plate.
 ##  3. Repeated state or no legal move => unsolvable.
 
+const RulesScript := preload("res://src/core/rules.gd")
+
 const MOVE_LIMIT := 400
 
 
@@ -56,7 +58,7 @@ static func solve(level: Dictionary) -> Dictionary:
 			var screw: Dictionary = screws[si]
 			if (screw["plates"] as Array).is_empty():
 				continue  # parked screws never make progress quasi-statically
-			if not Rules.can_remove(screw, board_holes, plates):
+			if not RulesScript.can_remove(screw, board_holes, plates):
 				continue
 			var rest: Array = screws.duplicate()
 			rest.remove_at(si)
@@ -76,7 +78,7 @@ static func solve(level: Dictionary) -> Dictionary:
 			for hi in board_holes.size():
 				if hi == int(screw["hole"]) and drops == 0:
 					continue  # putting it straight back is a no-op
-				var verdict: Dictionary = Rules.can_place(hi, board_holes, after, rest)
+				var verdict: Dictionary = RulesScript.can_place(hi, board_holes, after, rest)
 				if not verdict["ok"]:
 					continue
 				var rank: Array = [(verdict["pinned"] as Array).size(), hi]

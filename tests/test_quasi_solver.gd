@@ -4,6 +4,7 @@ extends SceneTree
 ## from tools/quasi_solver.py output).
 ## Run: godot --headless --path . --script res://tests/test_quasi_solver.gd
 
+const RulesScript := preload("res://src/core/rules.gd")
 const LevelLoaderScript := preload("res://src/core/level_loader.gd")
 const QuasiSolverScript := preload("res://src/core/quasi_solver.gd")
 
@@ -85,7 +86,7 @@ func _test_order_forced() -> void:
 		var copy: Dictionary = p.duplicate()
 		copy["xform"] = Transform2D.IDENTITY
 		snapshot_plates.append(copy)
-	_check(not Rules.can_remove(level["screws"][0], level["board_holes"], snapshot_plates),
+	_check(not RulesScript.can_remove(level["screws"][0], level["board_holes"], snapshot_plates),
 		"base screw is blocked while the brace covers it")
 	var result: Dictionary = QuasiSolverScript.solve(level)
 	_check(result["solvable"] and int(result["moves"]) == 2,

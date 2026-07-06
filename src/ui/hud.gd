@@ -2,6 +2,8 @@ class_name Hud
 extends Control
 ## Top bar during gameplay: level number, remaining screws, restart, menu.
 
+const UiKitScript := preload("res://src/ui/ui_kit.gd")
+
 signal restart_pressed
 signal menu_pressed
 
@@ -35,22 +37,22 @@ func _ready() -> void:
 	pad_left.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bar.add_child(pad_left)
 
-	var level_label := UiKit.make_label("Level %d" % _level_number, 40)
+	var level_label := UiKitScript.make_label("Level %d" % _level_number, 40)
 	level_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	bar.add_child(level_label)
 
-	_moves_label = UiKit.make_label("", 32, Color("#c9d2da"))
+	_moves_label = UiKitScript.make_label("", 32, Color("#c9d2da"))
 	_moves_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_moves_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	bar.add_child(_moves_label)
 	set_moves(_moves)
 
-	var restart_btn := UiKit.make_button("↻", Vector2(96, 96))
+	var restart_btn := UiKitScript.make_button("↻", Vector2(96, 96))
 	restart_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	restart_btn.pressed.connect(func() -> void: restart_pressed.emit())
 	bar.add_child(restart_btn)
 
-	var menu_btn := UiKit.make_button("≡", Vector2(96, 96))
+	var menu_btn := UiKitScript.make_button("≡", Vector2(96, 96))
 	menu_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	menu_btn.pressed.connect(func() -> void: menu_pressed.emit())
 	bar.add_child(menu_btn)

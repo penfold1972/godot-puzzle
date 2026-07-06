@@ -12,6 +12,8 @@ signal level_cleared
 const PlateBodyScript := preload("res://src/entities/plate_body.gd")
 const BoardHoleScript := preload("res://src/entities/board_hole.gd")
 const ScrewScript := preload("res://src/entities/screw.gd")
+const LevelLoaderScript := preload("res://src/core/level_loader.gd")
+const RulesScript := preload("res://src/core/rules.gd")
 const HudScript := preload("res://src/ui/hud.gd")
 const WinOverlayScript := preload("res://src/ui/win_overlay.gd")
 
@@ -48,7 +50,7 @@ func _ready() -> void:
 	if level_data.is_empty():
 		if game_state != null:
 			level_number = game_state.current_level
-		level_data = LevelLoader.load_level(level_number)
+		level_data = LevelLoaderScript.load_level(level_number)
 	elif level_data.has("id") and int(level_data["id"]) > 0:
 		level_number = int(level_data["id"])
 
@@ -61,7 +63,7 @@ func _ready() -> void:
 	if not headless_test:
 		_build_ui()
 	# Apply the real support states once everything exists.
-	for plate: PlateBody in _plate_nodes.values():
+	for plate: PlateBodyScript in _plate_nodes.values():
 		_apply_support(plate)
 
 
@@ -102,7 +104,7 @@ func _build_board() -> void:
 
 	_hole_nodes.clear()
 	for i in _board_holes.size():
-		var hole: BoardHole = BoardHoleScript.new()
+		var hole: BoardHoleScript = BoardHoleScript.new()
 		hole.hole_index = i
 		hole.position = _board_holes[i]
 		hole.tapped.connect(_on_hole_tapped)
@@ -112,7 +114,7 @@ func _build_board() -> void:
 	_plate_nodes.clear()
 	var plates: Array = level_data["plates"]
 	for plate_data: Dictionary in plates:
-		var plate: PlateBody = PlateBodyScript.new()
+		var plate: PlateBodyScript = PlateBodyScript.new()
 		_board.add_child(plate)
 		plate.setup(plate_data)
 		plate.fell_off.connect(_on_plate_fell)
@@ -120,7 +122,7 @@ func _build_board() -> void:
 
 	_screw_models.clear()
 	for screw_data: Dictionary in level_data["screws"]:
-		var screw: Screw = ScrewScript.new()
+		var screw: ScrewScript = ScrewScript.new()
 		screw.hole_index = int(screw_data["hole"])
 		screw.position = _board_holes[screw.hole_index]
 		screw.tapped.connect(_on_screw_tapped)
@@ -153,7 +155,7 @@ func _build_ui() -> void:
 
 func _plate_snapshots() -> Array:
 	var out: Array = []
-	for plate: PlateBody in _plate_nodes.values():
+	for plate: PlateBodyScript in _plate_nodes.values():
 		out.append(plate.current_local_snapshot())
 	return out
 
@@ -168,7 +170,7 @@ func _pins_of(plate_id: int) -> Array:
 	return out
 
 
-func _model_of(screw: Screw) -> Dictionary:
+func _model_of(screw: ScrewScript) -> Dictionary:
 	for s: Dictionary in _screw_models:
 		if s["node"] == screw:
 			return s
@@ -177,7 +179,7 @@ func _model_of(screw: Screw) -> Dictionary:
 
 # ------------------------------------------------------ physics management
 
-func _apply_support(plate: PlateBody) -> void:
+func _apply_support(plate: PlateBodyScript) -> void:
 	_remove_joint(plate.plate_id)
 	var pins := _pins_of(plate.plate_id)
 	if pins.size() >= 2:
@@ -189,7 +191,7 @@ func _apply_support(plate: PlateBody) -> void:
 		plate.make_dynamic()
 
 
-func _add_joint(plate: PlateBody, world_pos: Vector2) -> void:
+func _add_joint(plate: PlateBodyScript, world_pos: Vector2) -> void:
 	var joint := PinJoint2D.new()
 	joint.position = world_pos
 	_joints_root.add_child(joint)
@@ -209,7 +211,7 @@ func _remove_joint(plate_id: int) -> void:
 ## Hold every currently movable plate in place while a screw is in hand.
 func _freeze_world() -> void:
 	_frozen_velocities.clear()
-	for plate: PlateBody in _plate_nodes.values():
+	for plate: PlateBodyScript in _plate_nodes.values():
 		if _pins_of(plate.plate_id).size() <= 1:
 			_frozen_velocities[plate] = {
 				"lv": plate.linear_velocity, "av": plate.angular_velocity}
@@ -218,7 +220,7 @@ func _freeze_world() -> void:
 
 ## Re-apply true support states and give moving plates their momentum back.
 func _unfreeze_world() -> void:
-	for plate: PlateBody in _plate_nodes.values():
+	for plate: PlateBodyScript in _plate_nodes.values():
 		_apply_support(plate)
 	for plate: Variant in _frozen_velocities:
 		if is_instance_valid(plate) and _pins_of(plate.plate_id).size() <= 1:
@@ -229,7 +231,7 @@ func _unfreeze_world() -> void:
 
 # ------------------------------------------------------------- interaction
 
-func _on_screw_tapped(screw: Screw) -> void:
+func _on_screw_tapped(screw: ScrewScript) -> void:
 	if _state == State.WON:
 		return
 	if _state == State.IN_HAND:
@@ -239,7 +241,7 @@ func _on_screw_tapped(screw: Screw) -> void:
 	var model := _model_of(screw)
 	if model.is_empty():
 		return
-	if not Rules.can_remove(model, _board_holes, _plate_snapshots()):
+	if not RulesScript.can_remove(model, _board_holes, _plate_snapshots()):
 		screw.play_blocked_feedback()
 		return
 	_state = State.IN_HAND
@@ -254,13 +256,13 @@ func _on_screw_tapped(screw: Screw) -> void:
 	_update_hole_highlights()
 
 
-func _on_hole_tapped(hole: BoardHole) -> void:
+func _on_hole_tapped(hole: BoardHoleScript) -> void:
 	if _state != State.IN_HAND or _hand.is_empty():
 		return
-	var screw: Screw = _hand["model"]["node"]
+	var screw: ScrewScript = _hand["model"]["node"]
 	if screw.busy:
 		return
-	var verdict: Dictionary = Rules.can_place(
+	var verdict: Dictionary = RulesScript.can_place(
 		hole.hole_index, _board_holes, _plate_snapshots(), _screw_models)
 	if not verdict["ok"]:
 		hole.play_invalid_feedback()
@@ -292,7 +294,7 @@ func _cancel_hand() -> void:
 	_screw_models.append(model)
 	_hand = {}
 	_clear_hole_highlights()
-	var screw: Screw = model["node"]
+	var screw: ScrewScript = model["node"]
 	await screw.screw_in(_board_holes[origin], origin)
 	_state = State.IDLE
 	_unfreeze_world()
@@ -300,20 +302,20 @@ func _cancel_hand() -> void:
 
 func _update_hole_highlights() -> void:
 	var snapshots := _plate_snapshots()
-	for hole: BoardHole in _hole_nodes:
-		var verdict: Dictionary = Rules.can_place(
+	for hole: BoardHoleScript in _hole_nodes:
+		var verdict: Dictionary = RulesScript.can_place(
 			hole.hole_index, _board_holes, snapshots, _screw_models)
 		hole.highlighted = verdict["ok"]
 
 
 func _clear_hole_highlights() -> void:
-	for hole: BoardHole in _hole_nodes:
+	for hole: BoardHoleScript in _hole_nodes:
 		hole.highlighted = false
 
 
 # ------------------------------------------------------------------ ending
 
-func _on_plate_fell(plate: PlateBody) -> void:
+func _on_plate_fell(plate: PlateBodyScript) -> void:
 	_remove_joint(plate.plate_id)
 	_plate_nodes.erase(plate.plate_id)
 	if _plate_nodes.is_empty() and _state != State.WON:
@@ -328,7 +330,7 @@ func _on_win() -> void:
 	level_cleared.emit()
 	if _overlay != null:
 		await get_tree().create_timer(WIN_DELAY).timeout
-		var is_last := level_number >= LevelLoader.level_count()
+		var is_last := level_number >= LevelLoaderScript.level_count()
 		_overlay.show_win(level_number, is_last)
 
 

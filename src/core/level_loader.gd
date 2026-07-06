@@ -12,6 +12,8 @@ extends RefCounted
 ## board coordinates in the file. Empty holes are the board holes no screw
 ## references; every level must start with at least one.
 
+const RulesScript := preload("res://src/core/rules.gd")
+
 const LEVELS_DIR := "res://levels/"
 const INDEX_PATH := "res://levels/index.json"
 const MIN_PLATE_AREA := 2000.0
@@ -199,11 +201,11 @@ static func validate(level: Dictionary) -> Array[String]:
 			errors.append("board hole %d used by more than one screw" % hole)
 		used_holes[hole] = true
 		var point := board_holes[hole]
-		var covering := Rules.covering_plates(point, rest_plates)
+		var covering: Array[int] = RulesScript.covering_plates(point, rest_plates)
 		covering.sort()
 		var declared: Array = (s["plates"] as Array).duplicate()
 		declared.sort()
-		var same := covering.size() == declared.size()
+		var same: bool = covering.size() == declared.size()
 		if same:
 			for k in covering.size():
 				if int(covering[k]) != int(declared[k]):

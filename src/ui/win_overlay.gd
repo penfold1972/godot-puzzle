@@ -2,6 +2,8 @@ class_name WinOverlay
 extends Control
 ## Full-screen "Level Complete!" overlay with Next Level / Level Select.
 
+const UiKitScript := preload("res://src/ui/ui_kit.gd")
+
 signal next_pressed
 signal select_pressed
 
@@ -21,21 +23,21 @@ func _ready() -> void:
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	add_child(center)
 
-	var panel := UiKit.make_panel()
+	var panel := UiKitScript.make_panel()
 	center.add_child(panel)
 
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 28)
 	panel.add_child(box)
 
-	_title_label = UiKit.make_label("Level Complete!", 52, UiKit.ACCENT)
+	_title_label = UiKitScript.make_label("Level Complete!", 52, UiKitScript.ACCENT)
 	box.add_child(_title_label)
 
-	_next_btn = UiKit.make_button("Next Level", Vector2(360, 96))
+	_next_btn = UiKitScript.make_button("Next Level", Vector2(360, 96))
 	_next_btn.pressed.connect(func() -> void: next_pressed.emit())
 	box.add_child(_next_btn)
 
-	var select_btn := UiKit.make_button("Level Select", Vector2(360, 96))
+	var select_btn := UiKitScript.make_button("Level Select", Vector2(360, 96))
 	select_btn.pressed.connect(func() -> void: select_pressed.emit())
 	box.add_child(select_btn)
 

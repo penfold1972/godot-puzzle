@@ -1,6 +1,9 @@
 extends Control
 ## Level select: scrollable 5-column grid of level buttons with lock state.
 
+const UiKitScript := preload("res://src/ui/ui_kit.gd")
+const LevelLoaderScript := preload("res://src/core/level_loader.gd")
+
 const COLUMNS := 5
 
 
@@ -26,11 +29,11 @@ func _ready() -> void:
 	header.add_theme_constant_override("separation", 20)
 	layout.add_child(header)
 
-	var back_btn := UiKit.make_button("<", Vector2(96, 96))
+	var back_btn := UiKitScript.make_button("<", Vector2(96, 96))
 	back_btn.pressed.connect(_on_back)
 	header.add_child(back_btn)
 
-	var heading := UiKit.make_label("Select Level", 48)
+	var heading := UiKitScript.make_label("Select Level", 48)
 	heading.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header.add_child(heading)
 
@@ -52,9 +55,9 @@ func _ready() -> void:
 
 	var game_state := get_node_or_null("/root/GameState")
 	var unlocked: int = 1 if game_state == null else game_state.unlocked_up_to
-	var count := LevelLoader.level_count()
+	var count := LevelLoaderScript.level_count()
 	for n in range(1, count + 1):
-		var btn := UiKit.make_button(str(n), Vector2(112, 112))
+		var btn := UiKitScript.make_button(str(n), Vector2(112, 112))
 		if n > unlocked:
 			btn.disabled = true
 			btn.text = "🔒"
