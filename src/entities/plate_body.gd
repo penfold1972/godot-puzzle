@@ -69,13 +69,17 @@ func setup(data: Dictionary) -> void:
 	outline.joint_mode = Line2D.LINE_JOINT_ROUND
 	add_child(outline)
 
-
-func _draw() -> void:
-	# Screw-hole dimples; they move/rotate with the plate, matching the
-	# hole positions Rules evaluates through the transform.
-	for h in holes:
-		draw_circle(h, HOLE_RING_RADIUS, fill_color.darkened(0.55))
-		draw_circle(h, HOLE_RING_RADIUS - 4.0, fill_color.darkened(0.3))
+	# Screw-hole dimples drawn ABOVE the fill polygon (a plain _draw on the
+	# body would render underneath the Polygon2D child). They move/rotate
+	# with the plate, matching the hole positions Rules evaluates through
+	# the transform.
+	var dimples := Node2D.new()
+	dimples.draw.connect(func() -> void:
+		for h in holes:
+			dimples.draw_circle(h, HOLE_RING_RADIUS, fill_color.darkened(0.55))
+			dimples.draw_circle(h, HOLE_RING_RADIUS - 4.0, fill_color.darkened(0.3)))
+	add_child(dimples)
+	dimples.queue_redraw()
 
 
 ## Support state setters -- all deferred: physics state must never be

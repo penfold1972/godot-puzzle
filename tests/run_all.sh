@@ -7,7 +7,7 @@ GODOT="${GODOT:-godot}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FAILED=0
 
-for test in test_blocking test_level_data test_detach; do
+for test in test_rules test_level_data test_scene_v2; do
     echo ""
     echo "--- $test ---"
     "$GODOT" --headless --path "$DIR" --script "res://tests/$test.gd"

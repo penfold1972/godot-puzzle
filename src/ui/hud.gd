@@ -5,14 +5,14 @@ extends Control
 signal restart_pressed
 signal menu_pressed
 
-var _screws_label: Label
+var _moves_label: Label
 var _level_number := 1
-var _screws := 0
+var _moves := 0
 
 
-func setup(level_number: int, screws: int) -> void:
+func setup(level_number: int, moves: int) -> void:
 	_level_number = level_number
-	_screws = screws
+	_moves = moves
 
 
 func _ready() -> void:
@@ -39,11 +39,11 @@ func _ready() -> void:
 	level_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	bar.add_child(level_label)
 
-	_screws_label = UiKit.make_label("", 32, Color("#c9d2da"))
-	_screws_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_screws_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	bar.add_child(_screws_label)
-	set_screws(_screws)
+	_moves_label = UiKit.make_label("", 32, Color("#c9d2da"))
+	_moves_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_moves_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	bar.add_child(_moves_label)
+	set_moves(_moves)
 
 	var restart_btn := UiKit.make_button("↻", Vector2(96, 96))
 	restart_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
@@ -61,7 +61,7 @@ func _ready() -> void:
 	bar.add_child(pad_right)
 
 
-func set_screws(n: int) -> void:
-	_screws = n
-	if _screws_label != null:
-		_screws_label.text = "Screws: %d" % n
+func set_moves(n: int) -> void:
+	_moves = n
+	if _moves_label != null:
+		_moves_label.text = "Moves: %d" % n
