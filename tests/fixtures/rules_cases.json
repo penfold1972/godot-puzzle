@@ -1,0 +1,97 @@
+{
+  "comment": "Shared rule-parity cases for src/core/rules.gd and tools/rules.py. xform is (xa_x, xa_y, ya_x, ya_y, o_x, o_y); omitted = identity.",
+  "scenarios": [
+    {
+      "name": "basic cover, park and occupied hole",
+      "board_holes": [[100, 100], [300, 100], [500, 100], [300, 300]],
+      "plates": [
+        {"id": 0, "layer": 0,
+         "points": [[250, 250], [350, 250], [350, 350], [250, 350]],
+         "holes": [[300, 300]]}
+      ],
+      "screws": [{"hole": 3, "plates": [0]}],
+      "checks": [
+        {"fn": "covering", "point": [300, 300], "expect": [0]},
+        {"fn": "covering", "point": [100, 100], "expect": []},
+        {"fn": "can_remove", "screw": 0, "expect": true},
+        {"fn": "can_place", "hole": 0, "expect_ok": true, "expect_pinned": []},
+        {"fn": "can_place", "hole": 3, "expect_ok": false, "expect_pinned": []}
+      ]
+    },
+    {
+      "name": "blocked removal: parked screw under plate; multi-pin removal ok",
+      "board_holes": [[300, 300], [420, 420], [100, 100], [230, 230]],
+      "plates": [
+        {"id": 0, "layer": 0,
+         "points": [[200, 200], [400, 200], [400, 400], [200, 400]],
+         "holes": [[300, 300], [230, 230]]},
+        {"id": 1, "layer": 1,
+         "points": [[250, 250], [450, 250], [450, 450], [250, 450]],
+         "holes": [[300, 300], [420, 420]]}
+      ],
+      "screws": [
+        {"hole": 0, "plates": [0, 1]},
+        {"hole": 1, "plates": [1]},
+        {"hole": 3, "plates": []}
+      ],
+      "checks": [
+        {"fn": "covering", "point": [300, 300], "expect": [0, 1]},
+        {"fn": "can_remove", "screw": 0, "expect": true},
+        {"fn": "can_remove", "screw": 1, "expect": true},
+        {"fn": "can_remove", "screw": 2, "expect": false},
+        {"fn": "can_place", "hole": 2, "expect_ok": true, "expect_pinned": []}
+      ]
+    },
+    {
+      "name": "lower pinned plate blocked by higher unpinned cover",
+      "board_holes": [[300, 300], [430, 430]],
+      "plates": [
+        {"id": 0, "layer": 0,
+         "points": [[200, 200], [400, 200], [400, 400], [200, 400]],
+         "holes": [[300, 300]]},
+        {"id": 1, "layer": 1,
+         "points": [[250, 250], [450, 250], [450, 450], [250, 450]],
+         "holes": [[430, 430]]}
+      ],
+      "screws": [
+        {"hole": 0, "plates": [0]},
+        {"hole": 1, "plates": [1]}
+      ],
+      "checks": [
+        {"fn": "can_remove", "screw": 0, "expect": false},
+        {"fn": "can_remove", "screw": 1, "expect": true}
+      ]
+    },
+    {
+      "name": "placement alignment tolerance boundary",
+      "board_holes": [[300, 300], [300, 340]],
+      "plates": [
+        {"id": 0, "layer": 0,
+         "points": [[200, 200], [400, 200], [400, 400], [200, 400]],
+         "holes": [[309.9, 300], [310.2, 340]]}
+      ],
+      "screws": [],
+      "checks": [
+        {"fn": "can_place", "hole": 0, "expect_ok": true, "expect_pinned": [0]},
+        {"fn": "can_place", "hole": 1, "expect_ok": false, "expect_pinned": []}
+      ]
+    },
+    {
+      "name": "rotated plate: hole alignment follows the transform",
+      "board_holes": [[260, 300], [340, 300]],
+      "plates": [
+        {"id": 0, "layer": 0,
+         "points": [[-50, -50], [50, -50], [50, 50], [-50, 50]],
+         "holes": [[0, 40]],
+         "xform": [0, 1, -1, 0, 300, 300]}
+      ],
+      "screws": [],
+      "checks": [
+        {"fn": "covering", "point": [260, 300], "expect": [0]},
+        {"fn": "covering", "point": [360, 300], "expect": []},
+        {"fn": "can_place", "hole": 0, "expect_ok": true, "expect_pinned": [0]},
+        {"fn": "can_place", "hole": 1, "expect_ok": false, "expect_pinned": []}
+      ]
+    }
+  ]
+}
