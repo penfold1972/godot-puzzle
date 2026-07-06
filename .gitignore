@@ -1,0 +1,7 @@
+# Godot 4 cache/import directory
+.godot/
+
+# Exported builds
+export/
+*.apk
+*.aab
